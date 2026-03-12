@@ -100,8 +100,9 @@ def get_transcript_apify(video_id):
         # Start the actor
         actor_url = "https://api.apify.com/v2/acts/starvibe~youtube-video-transcript/runs"
         data = json.dumps({
-            "url": f"https://www.youtube.com/watch?v={video_id}",
-            "languages": ["en"]
+            "youtube_url": f"https://www.youtube.com/watch?v={video_id}",
+            "language": "en",
+            "include_transcript_text": True
         }).encode('utf-8')
         
         req = urllib.request.Request(

@@ -2,12 +2,12 @@
 """
 YouTube Knowledge Extractor - Web App
 Uses Apify starvibe/youtube-video-transcript + MiniMax for summarization
+Saves notes to Google Drive
 """
 
 import os
 import json
 import re
-import http.client
 import urllib.request
 import urllib.parse
 import time
@@ -17,6 +17,7 @@ app = Flask(__name__)
 
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 APIFY_TOKEN = os.environ.get("APIFY_TOKEN", "")
+GOOGLE_SERVICE_ACCOUNT_JSON = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "")
 
 HTML = '''
 <!DOCTYPE html>
@@ -28,9 +29,10 @@ HTML = '''
         body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; max-width: 800px; margin: 50px auto; padding: 20px; background: #0f0f0f; color: #fff; }
         h1 { text-align: center; color: #ff0000; }
         input { width: 100%; padding: 15px; font-size: 16px; border: none; border-radius: 8px; margin-bottom: 15px; background: #222; color: #fff; }
-        button { width: 100%; padding: 15px; font-size: 16px; background: #ff0000; color: white; border: none; border-radius: 8px; cursor: pointer; }
+        button { width: 100%; padding: 15px; font-size: 16px; background: #ff0000; color: white; border: none; border-radius: 8px; cursor: pointer; margin-bottom: 10px; }
         button:hover { background: #cc0000; }
         button:disabled { background: #666; }
+        .secondary { background: #333; }
         #result { background: #1a1a1a; padding: 20px; border-radius: 8px; margin-top: 20px; white-space: pre-wrap; overflow-x: auto; max-height: 600px; }
         .loading { text-align: center; color: #888; }
         .error { color: #ff6b6b; }
@@ -41,23 +43,39 @@ HTML = '''
     <h1>📺 YouTube Knowledge Extractor</h1>
     <input type="text" id="url" placeholder="Paste YouTube URL here..." />
     <button onclick="extract()" id="btn">Extract Knowledge</button>
+    <button onclick="extractAndSave()" id="btn2" class="secondary">Extract + Save to Drive</button>
     <div id="result"></div>
     <script>
         async function extract() {
+            await doExtract(false);
+        }
+        async function extractAndSave() {
+            await doExtract(true);
+        }
+        async function doExtract(saveToDrive) {
             const url = document.getElementById('url').value;
             const btn = document.getElementById('btn');
+            const btn2 = document.getElementById('btn2');
             const result = document.getElementById('result');
             if(!url) return;
             btn.disabled = true;
+            btn2.disabled = true;
             btn.textContent = 'Transcribing video...';
             result.innerHTML = '<div class="loading">Using AI to transcribe audio...</div>';
             try {
-                const res = await fetch('/extract', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({url}) });
+                const res = await fetch('/extract', { 
+                    method: 'POST', 
+                    headers: {'Content-Type': 'application/json'}, 
+                    body: JSON.stringify({url, save_to_drive: saveToDrive}) 
+                });
                 const data = await res.json();
                 if (data.error) {
                     result.innerHTML = '<div class="error">Error: ' + data.error + '</div>';
                 } else {
                     let html = '<div class="success">✅ Extracted!</div><br>';
+                    if (data.drive_url) {
+                        html += '<div class="success">📁 Saved to Drive: <a href="' + data.drive_url + '" target="_blank" style="color:#4dabf7">' + data.drive_url + '</a></div><br>';
+                    }
                     html += '<strong>📺 ' + (data.title || 'Unknown') + '</strong><br><br>';
                     html += '<strong>⏱️ Duration:</strong> ' + (data.duration_estimate || 'Unknown') + '<br><br>';
                     html += '<strong>💡 Key Insights:</strong><ul>';
@@ -72,7 +90,9 @@ HTML = '''
                 }
             } catch(e) { result.innerHTML = '<div class="error">Error: ' + e + '</div>'; }
             btn.disabled = false;
+            btn2.disabled = false;
             btn.textContent = 'Extract Knowledge';
+            btn2.textContent = 'Extract + Save to Drive';
         }
     </script>
 </body>
@@ -98,7 +118,6 @@ def get_transcript_apify(video_id):
         return None, "APIFY_TOKEN not configured"
     
     try:
-        # Start the actor
         actor_url = "https://api.apify.com/v2/acts/starvibe~youtube-video-transcript/runs"
         data = json.dumps({
             "youtube_url": f"https://www.youtube.com/watch?v={video_id}",
@@ -122,7 +141,6 @@ def get_transcript_apify(video_id):
         if not execution_id:
             return None, "Failed to start Apify actor"
         
-        # Wait for completion (max 90s for transcription)
         for _ in range(45):
             time.sleep(2)
             status_url = f"https://api.apify.com/v2/acts/starvibe~youtube-video-transcript/runs/{execution_id}"
@@ -139,7 +157,6 @@ def get_transcript_apify(video_id):
         else:
             return None, "Transcription timed out"
         
-        # Fetch results
         dataset_url = f"https://api.apify.com/v2/datasets/{dataset_id}/items"
         req = urllib.request.Request(dataset_url, headers={"Authorization": f"Bearer {APIFY_TOKEN}"})
         with urllib.request.urlopen(req) as resp:
@@ -147,15 +164,12 @@ def get_transcript_apify(video_id):
         
         if items:
             item = items[0]
-            # The actor returns transcript in different formats
-            transcript = item.get('transcript') or item.get('text') or item.get('content')
+            transcript = item.get('transcript_text') or item.get('transcript')
             if transcript:
                 if isinstance(transcript, list):
-                    # Combine all parts
                     text = " ".join([t.get('text', '') for t in transcript])
                     return text, "Apify AI Transcription"
-                elif isinstance(transcript, str):
-                    return transcript, "Apify AI Transcription"
+                return transcript, "Apify AI Transcription"
         
         return None, "No transcript in response"
         
@@ -229,6 +243,60 @@ Return ONLY valid JSON."""
         return {"error": str(e)}
 
 
+def save_to_drive(summary, video_id, title):
+    """Save notes to Google Drive."""
+    if not GOOGLE_SERVICE_ACCOUNT_JSON:
+        return None
+    
+    try:
+        from google.oauth2 import service_account
+        from googleapiclient.discovery import build
+        from googleapiclient.http import MediaInMemoryUpload
+        
+        creds_data = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
+        
+        # Get access token
+        scopes = ['https://www.googleapis.com/auth/drive.file']
+        credentials = service_account.Credentials.from_service_account_info(creds_data, scopes=scopes)
+        
+        drive_service = build('drive', 'v3', credentials=credentials)
+        
+        # Create file content
+        content = f"""# 📺 {summary.get('title', title)}
+
+## ⏱️ Duration
+{summary.get('duration_estimate', 'Unknown')}
+
+## 💡 Key Insights
+{chr(10).join(['- ' + i for i in summary.get('key_insights', [])])}
+
+## 🎯 Actionable Ideas
+{chr(10).join(['- ' + i for i in summary.get('actionable_ideas', [])])}
+
+## 💬 Best Quote
+> {summary.get('best_quote', 'N/A')}
+
+---
+*Generated by YouTube Knowledge Extractor*
+*Video ID: {video_id}*
+"""
+        
+        # Clean filename
+        safe_title = re.sub(r'[^\w\s-]', '', title)[:50].strip()
+        filename = f"YouTube Notes - {safe_title}.md"
+        
+        file_metadata = {'name': filename, 'mimeType': 'text/markdown'}
+        media = MediaInMemoryUpload(content.encode(), mimetype='text/markdown')
+        
+        file = drive_service.files().create(body=file_metadata, media_body=media, fields='id,webViewLink').execute()
+        
+        return file.get('webViewLink')
+        
+    except Exception as e:
+        print(f"Drive save error: {e}")
+        return None
+
+
 @app.route('/')
 def home():
     return render_template_string(HTML)
@@ -238,6 +306,8 @@ def home():
 def extract():
     data = request.json
     url = data.get('url', '')
+    save_to_drive_flag = data.get('save_to_drive', False)
+    
     if not url:
         return jsonify({"error": "No URL provided"}), 400
     
@@ -261,6 +331,12 @@ def extract():
     summary = summarize_with_minimax(video_id, transcript, title)
     summary['video_id'] = video_id
     summary['transcript_method'] = method
+    
+    # Save to Drive if requested
+    drive_url = None
+    if save_to_drive_flag:
+        drive_url = save_to_drive(summary, video_id, title)
+        summary['drive_url'] = drive_url
     
     return jsonify(summary)
 

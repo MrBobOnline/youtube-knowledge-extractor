@@ -261,6 +261,24 @@ def save_to_drive(summary, video_id, title):
         
         drive_service = build('drive', 'v3', credentials=credentials)
         
+        # Find or create "Youtube Summary" folder
+        folder_name = "Youtube Summary"
+        response = drive_service.files().list(
+            q=f"name='{folder_name}' and mimeType='application/vnd.google-apps.folder'",
+            fields="files(id)"
+        ).execute()
+        
+        if response.get('files'):
+            folder_id = response['files'][0]['id']
+        else:
+            # Create folder
+            file_metadata = {
+                'name': folder_name,
+                'mimeType': 'application/vnd.google-apps.folder'
+            }
+            folder = drive_service.files().create(body=file_metadata, fields='id').execute()
+            folder_id = folder.get('id')
+        
         # Create file content
         content = f"""# 📺 {summary.get('title', title)}
 
@@ -285,7 +303,11 @@ def save_to_drive(summary, video_id, title):
         safe_title = re.sub(r'[^\w\s-]', '', title)[:50].strip()
         filename = f"YouTube Notes - {safe_title}.md"
         
-        file_metadata = {'name': filename, 'mimeType': 'text/markdown'}
+        file_metadata = {
+            'name': filename,
+            'mimeType': 'text/markdown',
+            'parents': [folder_id]
+        }
         media = MediaInMemoryUpload(content.encode(), mimetype='text/markdown')
         
         file = drive_service.files().create(body=file_metadata, media_body=media, fields='id,webViewLink').execute()

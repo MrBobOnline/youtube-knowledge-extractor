@@ -57,6 +57,9 @@ HTML = '''
                     let html = '<div class="success">✅ Extracted!</div><br>';
                     html += '<strong>📺 ' + (data.title || 'Unknown') + '</strong><br><br>';
                     html += '<strong>⏱️ Duration:</strong> ' + (data.duration_estimate || 'Unknown') + '<br><br>';
+                    if (data.source === 'web_search') {
+                        html += '<div style="background:#2a2a00;padding:10px;border-radius:5px;margin-bottom:10px;">⚠️ No captions found - used AI web search to generate insights</div>';
+                    }
                     html += '<strong>💡 Key Insights:</strong><ul>';
                     (data.key_insights || []).forEach(i => html += '<li>' + i + '</li>');
                     html += '</ul><strong>🎯 Actionable Ideas:</strong><ul>';
@@ -100,15 +103,16 @@ def get_transcript(video_id):
             data = response.read().decode('utf-8')
             text = re.sub(r'<[^>]+>', ' ', data)
             text = re.sub(r'\s+', ' ', text).strip()
-            return text
+            if len(text) > 50:
+                return text
         return None
     except Exception as e:
         print(f"Transcript error: {e}")
         return None
 
 
-def get_video_title(video_id):
-    """Get video title from oEmbed."""
+def get_video_info(video_id):
+    """Get video title, description from oEmbed."""
     try:
         conn = http.client.HTTPSConnection("noembed.com")
         headers = {"Content-Type": "application/json"}
@@ -117,14 +121,68 @@ def get_video_title(video_id):
         response = conn.getresponse()
         if response.status == 200:
             info = json.loads(response.read().decode())
-            return info.get('title', 'Unknown')
+            return info
     except:
         pass
-    return 'YouTube Video'
+    return {}
+
+
+def generate_from_web_search(video_id, title, description=""):
+    """Use Perplexity Sonar to search for video content and generate insights."""
+    if not OPENROUTER_API_KEY:
+        return {"error": "OPENROUTER_API_KEY not configured"}
+    
+    search_query = f"{title} {description}" if description else title
+    
+    prompt = f"""Search for information about this YouTube video and create structured knowledge notes.
+
+Video Title: {title}
+Video ID: {video_id}
+
+Based on the title, search for what this video is about and generate useful insights.
+
+Create a JSON response with this exact structure:
+{{
+  "title": "{title}",
+  "duration_estimate": "Estimate based on typical content (e.g., 10-15 minutes)",
+  "key_insights": ["3-5 insights about the video content based on title and topic"],
+  "actionable_ideas": ["3-5 practical takeaways"],
+  "best_quote": "A relevant quote or summary"
+}}
+
+Be practical and useful. Return ONLY valid JSON."""
+
+    url = "https://openrouter.ai/api/v1/chat/completions"
+    payload = {
+        "model": "perplexity/sonar-pro",
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": 2000
+    }
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "HTTP-Referer": "https://youtube-knowledge-extractor.vercel.app",
+        "X-Title": "YouTube Knowledge Extractor"
+    }
+    
+    try:
+        conn = http.client.HTTPSConnection("openrouter.ai")
+        conn.request("POST", url, json.dumps(payload), headers)
+        response = conn.getresponse()
+        data = json.loads(response.read().decode())
+        content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+        json_match = re.search(r'\{.*\}', content, re.DOTALL)
+        if json_match:
+            result = json.loads(json_match.group())
+            result['source'] = 'web_search'
+            return result
+        return {"raw": content}
+    except Exception as e:
+        return {"error": str(e)}
 
 
 def summarize_with_llm(video_id, transcript, title=""):
-    """Use Perplexity Sonar via OpenRouter to generate summary."""
+    """Use Perplexity Sonar via OpenRouter to generate summary from transcript."""
     if not OPENROUTER_API_KEY:
         return {"error": "OPENROUTER_API_KEY not configured"}
     
@@ -193,13 +251,21 @@ def extract():
     if not video_id:
         return jsonify({"error": "Invalid YouTube URL"}), 400
     
-    title = get_video_title(video_id)
+    # Get video info
+    video_info = get_video_info(video_id)
+    title = video_info.get('title', 'YouTube Video')
+    description = video_info.get('description', '')
+    
+    # Try to get transcript
     transcript = get_transcript(video_id)
     
-    if not transcript:
-        transcript = "This video does not have captions available. Please use a video with English subtitles enabled."
+    if transcript:
+        # Use transcript for analysis
+        summary = summarize_with_llm(video_id, transcript, title)
+    else:
+        # Fallback: use web search to generate insights from title
+        summary = generate_from_web_search(video_id, title, description)
     
-    summary = summarize_with_llm(video_id, transcript, title)
     summary['video_id'] = video_id
     
     return jsonify(summary)

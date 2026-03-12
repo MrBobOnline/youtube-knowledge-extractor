@@ -12,6 +12,7 @@ import http.client
 import urllib.request
 import urllib.parse
 import time
+import uuid
 from flask import Flask, request, render_template_string, jsonify
 
 app = Flask(__name__)
@@ -19,6 +20,10 @@ app = Flask(__name__)
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 APIFY_TOKEN = os.environ.get("APIFY_TOKEN", "")
 GOOGLE_SERVICE_ACCOUNT_JSON = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "")
+CACHE_DIR = "/tmp/youtube_extracts"
+
+# Ensure cache dir exists
+os.makedirs(CACHE_DIR, exist_ok=True)
 
 HTML = '''
 <!DOCTYPE html>
@@ -40,6 +45,7 @@ HTML = '''
         .success { color: #51cf66; }
         .row { display: flex; gap: 10px; }
         .row > * { flex: 1; }
+        .hidden { display: none; }
     </style>
 </head>
 <body>
@@ -47,9 +53,9 @@ HTML = '''
     <input type="text" id="url" placeholder="Paste YouTube URL here..." />
     <div class="row">
         <button onclick="extract()" id="btn">Extract Knowledge</button>
-        <button onclick="extractAndSave()" id="btn2" class="secondary">Save to Drive</button>
+        <button onclick="saveToDrive()" id="btn2" class="secondary" disabled>Save to Drive</button>
     </div>
-    <select id="folder">
+    <select id="folder" disabled>
         <option value="Youtube Summary">Youtube Summary (default)</option>
         <option value="MellowMindCare">MellowMindCare</option>
         <option value="Spiritual Echoes">Spiritual Echoes</option>
@@ -57,39 +63,36 @@ HTML = '''
         <option value="AtlasCore">AtlasCore</option>
         <option value="MrBobOS">MrBobOS</option>
     </select>
+    <div id="extractId" class="hidden"></div>
     <div id="result"></div>
     <script>
+        let extractedData = null;
+        
         async function extract() {
-            await doExtract(false);
-        }
-        async function extractAndSave() {
-            await doExtract(true);
-        }
-        async function doExtract(saveToDrive) {
             const url = document.getElementById('url').value;
-            const folder = document.getElementById('folder').value;
             const btn = document.getElementById('btn');
             const btn2 = document.getElementById('btn2');
+            const folderSelect = document.getElementById('folder');
             const result = document.getElementById('result');
             if(!url) return;
             btn.disabled = true;
-            btn2.disabled = true;
             btn.textContent = 'Transcribing...';
             result.innerHTML = '<div class="loading">Using AI to transcribe audio...</div>';
             try {
                 const res = await fetch('/extract', { 
                     method: 'POST', 
                     headers: {'Content-Type': 'application/json'}, 
-                    body: JSON.stringify({url, save_to_drive: saveToDrive, drive_folder: folder}) 
+                    body: JSON.stringify({url}) 
                 });
                 const data = await res.json();
                 if (data.error) {
                     result.innerHTML = '<div class="error">Error: ' + data.error + '</div>';
                 } else {
-                    let html = '<div class="success">✅ Extracted!</div><br>';
-                    if (data.drive_url) {
-                        html += '<div class="success">📁 Saved to ' + folder + ': <a href="' + data.drive_url + '" target="_blank" style="color:#4dabf7">' + data.drive_url + '</a></div><br>';
-                    }
+                    extractedData = data;
+                    document.getElementById('extractId').textContent = data.extract_id;
+                    btn2.disabled = false;
+                    folderSelect.disabled = false;
+                    let html = '<div class="success">✅ Extracted! Ready to save.</div><br>';
                     html += '<strong>📺 ' + (data.title || 'Unknown') + '</strong><br><br>';
                     html += '<strong>⏱️ Duration:</strong> ' + (data.duration_estimate || 'Unknown') + '<br><br>';
                     html += '<strong>💡 Key Insights:</strong><ul>';
@@ -104,8 +107,33 @@ HTML = '''
                 }
             } catch(e) { result.innerHTML = '<div class="error">Error: ' + e + '</div>'; }
             btn.disabled = false;
-            btn2.disabled = false;
             btn.textContent = 'Extract Knowledge';
+        }
+        
+        async function saveToDrive() {
+            if(!extractedData) return;
+            const folder = document.getElementById('folder').value;
+            const btn2 = document.getElementById('btn2');
+            const result = document.getElementById('result');
+            btn2.disabled = true;
+            btn2.textContent = 'Saving...';
+            try {
+                const res = await fetch('/save', { 
+                    method: 'POST', 
+                    headers: {'Content-Type': 'application/json'}, 
+                    body: JSON.stringify({
+                        extract_id: extractedData.extract_id,
+                        drive_folder: folder
+                    }) 
+                });
+                const data = await res.json();
+                if (data.error) {
+                    result.innerHTML += '<div class="error">Save failed: ' + data.error + '</div>';
+                } else {
+                    result.innerHTML += '<div class="success">📁 Saved to ' + folder + ': <a href="' + data.drive_url + '" target="_blank" style="color:#4dabf7">' + data.drive_url + '</a></div>';
+                }
+            } catch(e) { result.innerHTML += '<div class="error">Save error: ' + e + '</div>'; }
+            btn2.disabled = false;
             btn2.textContent = 'Save to Drive';
         }
     </script>
@@ -257,7 +285,7 @@ Return ONLY valid JSON."""
         return {"error": str(e)}
 
 
-def save_to_drive(summary, video_id, title, folder_name="Youtube Summary"):
+def save_to_drive(summary, video_id, title, folder_name):
     """Save notes to Google Drive."""
     if not GOOGLE_SERVICE_ACCOUNT_JSON:
         return None
@@ -310,7 +338,6 @@ def save_to_drive(summary, video_id, title, folder_name="Youtube Summary"):
 *Video ID: {video_id}*
 """
         
-        # Clean filename
         safe_title = re.sub(r'[^\w\s-]', '', title)[:50].strip()
         filename = f"YouTube Notes - {safe_title}.md"
         
@@ -339,8 +366,6 @@ def home():
 def extract():
     data = request.json
     url = data.get('url', '')
-    save_to_drive_flag = data.get('save_to_drive', False)
-    drive_folder = data.get('drive_folder', 'Youtube Summary')
     
     if not url:
         return jsonify({"error": "No URL provided"}), 400
@@ -366,13 +391,52 @@ def extract():
     summary['video_id'] = video_id
     summary['transcript_method'] = method
     
-    # Save to Drive if requested
-    drive_url = None
-    if save_to_drive_flag:
-        drive_url = save_to_drive(summary, video_id, title, drive_folder)
-        summary['drive_url'] = drive_url
+    # Generate extract ID and cache
+    extract_id = str(uuid.uuid4())
+    cache_path = os.path.join(CACHE_DIR, f"{extract_id}.json")
+    with open(cache_path, 'w') as f:
+        json.dump(summary, f)
+    
+    # Clean old cache files (keep last 50)
+    try:
+        files = sorted(os.listdir(CACHE_DIR), key=lambda x: os.path.getmtime(os.path.join(CACHE_DIR, x)))
+        for old_file in files[:-50]:
+            os.remove(os.path.join(CACHE_DIR, old_file))
+    except:
+        pass
+    
+    summary['extract_id'] = extract_id
     
     return jsonify(summary)
+
+
+@app.route('/save', methods=['POST'])
+def save():
+    data = request.json
+    extract_id = data.get('extract_id', '')
+    folder_name = data.get('drive_folder', 'Youtube Summary')
+    
+    if not extract_id:
+        return jsonify({"error": "No extraction ID provided"}), 400
+    
+    # Load from cache
+    cache_path = os.path.join(CACHE_DIR, f"{extract_id}.json")
+    if not os.path.exists(cache_path):
+        return jsonify({"error": "Extraction not found. Please extract first."}), 400
+    
+    with open(cache_path) as f:
+        summary = json.load(f)
+    
+    video_id = summary.get('video_id', 'unknown')
+    title = summary.get('title', 'YouTube Video')
+    
+    # Save to Drive
+    drive_url = save_to_drive(summary, video_id, title, folder_name)
+    
+    if drive_url:
+        return jsonify({"drive_url": drive_url})
+    else:
+        return jsonify({"error": "Failed to save to Drive"}), 500
 
 
 if __name__ == '__main__':

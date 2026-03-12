@@ -117,6 +117,7 @@ HTML = '''
             const result = document.getElementById('result');
             btn2.disabled = true;
             btn2.textContent = 'Saving...';
+            result.innerHTML += '<div class="success">📁 Saving to ' + folder + '...</div>';
             try {
                 const res = await fetch('/save', { 
                     method: 'POST', 
@@ -128,11 +129,11 @@ HTML = '''
                 });
                 const data = await res.json();
                 if (data.error) {
-                    result.innerHTML += '<div class="error">Save failed: ' + data.error + '</div>';
+                    result.innerHTML += '<div class="error">❌ Save failed: ' + data.error + '</div>';
                 } else {
-                    result.innerHTML += '<div class="success">📁 Saved to ' + folder + ': <a href="' + data.drive_url + '" target="_blank" style="color:#4dabf7">' + data.drive_url + '</a></div>';
+                    result.innerHTML = '<div class="success">✅ File saved successfully to <strong>' + folder + '</strong>!</div><br><a href="' + data.drive_url + '" target="_blank" style="color:#4dabf7; font-size:18px;">📄 View File →</a>';
                 }
-            } catch(e) { result.innerHTML += '<div class="error">Save error: ' + e + '</div>'; }
+            } catch(e) { result.innerHTML += '<div class="error">❌ Save error: ' + e + '</div>'; }
             btn2.disabled = false;
             btn2.textContent = 'Save to Drive';
         }

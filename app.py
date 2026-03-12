@@ -1,17 +1,21 @@
 #!/usr/bin/env python3
 """
 YouTube Knowledge Extractor - Web App
-Turn YouTube videos into structured notes using MiniMax (cheap!)
+Uses Apify for transcripts + MiniMax for cheap summarization
 """
 
 import os
 import json
 import re
+import urllib.request
+import urllib.parse
+import time
 from flask import Flask, request, render_template_string, jsonify
 
 app = Flask(__name__)
 
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
+APIFY_TOKEN = os.environ.get("APIFY_TOKEN", "")
 
 HTML = '''
 <!DOCTYPE html>
@@ -44,8 +48,8 @@ HTML = '''
             const result = document.getElementById('result');
             if(!url) return;
             btn.disabled = true;
-            btn.textContent = 'Extracting... (may take 30s)';
-            result.innerHTML = '<div class="loading">Getting transcript + summarizing...</div>';
+            btn.textContent = 'Extracting via Apify...';
+            result.innerHTML = '<div class="loading">Fetching transcript from YouTube...</div>';
             try {
                 const res = await fetch('/extract', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({url}) });
                 const data = await res.json();
@@ -54,9 +58,6 @@ HTML = '''
                 } else {
                     let html = '<div class="success">✅ Extracted!</div><br>';
                     html += '<strong>📺 ' + (data.title || 'Unknown') + '</strong><br><br>';
-                    if (data.transcript_method) {
-                        html += '<div style="background:#1a3a1a;padding:8px;border-radius:5px;margin-bottom:10px;font-size:12px;">📝 Transcript: ' + data.transcript_method + '</div>';
-                    }
                     html += '<strong>⏱️ Duration:</strong> ' + (data.duration_estimate || 'Unknown') + '<br><br>';
                     html += '<strong>💡 Key Insights:</strong><ul>';
                     (data.key_insights || []).forEach(i => html += '<li>' + i + '</li>');
@@ -90,59 +91,79 @@ def extract_video_id(url):
     return None
 
 
-def get_transcript(video_id):
-    """Try multiple methods to get transcript."""
-    import sys
-    import subprocess
+def get_transcript_apify(video_id):
+    """Get transcript using Apify YouTube scraper."""
+    if not APIFY_TOKEN:
+        return None, "APIFY_TOKEN not configured"
     
-    # Try using youtube-transcript-api
     try:
-        result = subprocess.run(
-            [sys.executable, '-c', f'''
-from youtube_transcript_api import YouTubeTranscriptApi
-transcript = YouTubeTranscriptApi.get_transcript("{video_id}", languages=["en"])
-text = " ".join([t["text"] for t in transcript])
-print(text)
-'''],
-            capture_output=True, text=True, timeout=30
+        # Start the actor
+        actor_url = "https://api.apify.com/v2/acts/triangle~youtube-scraper/runs"
+        data = json.dumps({
+            "url": f"https://www.youtube.com/watch?v={video_id}",
+            "transcripts": True
+        }).encode('utf-8')
+        
+        req = urllib.request.Request(
+            actor_url,
+            data=data,
+            headers={
+                "Authorization": f"Token {APIFY_TOKEN}",
+                "Content-Type": "application/json"
+            }
         )
-        if result.returncode == 0 and len(result.stdout) > 50:
-            return result.stdout.strip(), "YouTube Transcript API"
+        
+        with urllib.request.urlopen(req, timeout=30) as response:
+            result = json.loads(response.read())
+            execution_id = result.get('data', {}).get('id')
+        
+        if not execution_id:
+            return None, "Failed to start Apify actor"
+        
+        # Wait for completion (max 60s)
+        for _ in range(30):
+            time.sleep(2)
+            status_url = f"https://api.apify.com/v2/acts/triangle~youtube-scraper/runs/{execution_id}"
+            req = urllib.request.Request(status_url, headers={"Authorization": f"Token {APIFY_TOKEN}"})
+            with urllib.request.urlopen(req) as resp:
+                status_data = json.loads(resp.read())
+                status = status_data.get('data', {}).get('status')
+                
+                if status == 'SUCCEEDED':
+                    dataset_id = status_data.get('data', {}).get('defaultDatasetId')
+                    break
+                elif status in ['FAILED', 'ABORTED']:
+                    return None, f"Apify actor failed: {status}"
+        else:
+            return None, "Apify actor timed out"
+        
+        # Fetch results
+        dataset_url = f"https://api.apify.com/v2/datasets/{dataset_id}/items"
+        req = urllib.request.Request(dataset_url, headers={"Authorization": f"Token {APIFY_TOKEN}"})
+        with urllib.request.urlopen(req) as resp:
+            items = json.loads(resp.read())
+        
+        if items:
+            item = items[0]
+            # Try transcript
+            transcript_data = item.get('transcript') or item.get('captions') or item.get('subtitles')
+            if transcript_data:
+                if isinstance(transcript_data, list):
+                    for t in transcript_data:
+                        if t.get('lang') == 'en' or t.get('languageCode') == 'en':
+                            return t.get('text', ''), "Apify"
+                elif isinstance(transcript_data, str):
+                    return transcript_data, "Apify"
+            
+            # Fallback to description
+            description = item.get('description', '')
+            if description and len(description) > 100:
+                return description, "Apify (description)"
+        
+        return None, "No transcript found"
+        
     except Exception as e:
-        print(f"youtube-transcript-api failed: {e}")
-    
-    # Fallback: try Invidious API
-    try:
-        import http.client
-        conn = http.client.HTTPSConnection("invidious.fdn.fr")
-        conn.request("GET", f"/api/v1/videos/{video_id}")
-        response = conn.getresponse()
-        if response.status == 200:
-            data = json.loads(response.read())
-            captions = data.get('captions', [])
-            for cap in captions:
-                if cap.get('languageCode') == 'en':
-                    # Get caption track
-                    conn2 = http.client.HTTPSConnection("invidious.fdn.fr")
-                    conn2.request("GET", f"/api/v1/captions/{video_id}?label=English")
-                    resp2 = conn2.getresponse()
-                    if resp2.status == 200:
-                        import base64
-                        import zlib
-                        try:
-                            raw = base64.b64decode(resp2.read())
-                            text = zlib.decompress(raw, 16 + zlib.MAX_WBITS).decode('utf-8')
-                            # Extract text from TTML
-                            import re
-                            texts = re.findall(r'<text[^>]*>([^<]+)</text>', text)
-                            if texts:
-                                return " ".join(texts), "Invidious Captions"
-                        except:
-                            pass
-    except Exception as e:
-        print(f"Invidious failed: {e}")
-    
-    return None, None
+        return None, f"Apify error: {str(e)[:50]}"
 
 
 def get_video_title(video_id):
@@ -165,15 +186,14 @@ def summarize_with_minimax(video_id, transcript, title=""):
     if not OPENROUTER_API_KEY:
         return {"error": "OPENROUTER_API_KEY not configured"}
     
-    # Truncate if too long
     if len(transcript) > 6000:
         transcript = transcript[-6000:]
     
-    prompt = f"""Analyze this YouTube video transcript and create structured notes.
+    prompt = f"""Analyze this YouTube video content and create structured notes.
 
 Video Title: {title}
 
-Transcript:
+Content:
 {transcript}
 
 Create a JSON with:
@@ -233,12 +253,12 @@ def extract():
     
     title = get_video_title(video_id)
     
-    # Get transcript
-    transcript, method = get_transcript(video_id)
+    # Get transcript via Apify
+    transcript, method = get_transcript_apify(video_id)
     
     if not transcript:
         return jsonify({
-            "error": "No captions available for this video. Try a video with English subtitles.",
+            "error": f"No captions. {method}. Try another video.",
             "title": title,
             "video_id": video_id
         }), 200

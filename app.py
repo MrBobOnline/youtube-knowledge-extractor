@@ -1,14 +1,12 @@
 #!/usr/bin/env python3
 """
 YouTube Knowledge Extractor - Web App
-Turn YouTube videos into structured notes.
+Turn YouTube videos into structured notes using MiniMax (cheap!)
 """
 
 import os
 import json
 import re
-import http.client
-from datetime import datetime
 from flask import Flask, request, render_template_string, jsonify
 
 app = Flask(__name__)
@@ -47,7 +45,7 @@ HTML = '''
             if(!url) return;
             btn.disabled = true;
             btn.textContent = 'Extracting... (may take 30s)';
-            result.innerHTML = '<div class="loading">Processing video...</div>';
+            result.innerHTML = '<div class="loading">Getting transcript + summarizing...</div>';
             try {
                 const res = await fetch('/extract', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({url}) });
                 const data = await res.json();
@@ -56,10 +54,10 @@ HTML = '''
                 } else {
                     let html = '<div class="success">✅ Extracted!</div><br>';
                     html += '<strong>📺 ' + (data.title || 'Unknown') + '</strong><br><br>';
-                    html += '<strong>⏱️ Duration:</strong> ' + (data.duration_estimate || 'Unknown') + '<br><br>';
-                    if (data.source === 'web_search') {
-                        html += '<div style="background:#2a2a00;padding:10px;border-radius:5px;margin-bottom:10px;">⚠️ No captions found - used AI web search to generate insights</div>';
+                    if (data.transcript_method) {
+                        html += '<div style="background:#1a3a1a;padding:8px;border-radius:5px;margin-bottom:10px;font-size:12px;">📝 Transcript: ' + data.transcript_method + '</div>';
                     }
+                    html += '<strong>⏱️ Duration:</strong> ' + (data.duration_estimate || 'Unknown') + '<br><br>';
                     html += '<strong>💡 Key Insights:</strong><ul>';
                     (data.key_insights || []).forEach(i => html += '<li>' + i + '</li>');
                     html += '</ul><strong>🎯 Actionable Ideas:</strong><ul>';
@@ -93,126 +91,108 @@ def extract_video_id(url):
 
 
 def get_transcript(video_id):
-    """Get transcript using YouTube's caption API."""
+    """Try multiple methods to get transcript."""
+    import sys
+    import subprocess
+    
+    # Try using youtube-transcript-api
     try:
-        conn = http.client.HTTPSConnection("www.youtube.com")
-        headers = {"User-Agent": "Mozilla/5.0"}
-        conn.request("GET", f"/api/timedtext?lang=en&v={video_id}", headers=headers)
-        response = conn.getresponse()
-        if response.status == 200:
-            data = response.read().decode('utf-8')
-            text = re.sub(r'<[^>]+>', ' ', data)
-            text = re.sub(r'\s+', ' ', text).strip()
-            if len(text) > 50:
-                return text
-        return None
+        result = subprocess.run(
+            [sys.executable, '-c', f'''
+from youtube_transcript_api import YouTubeTranscriptApi
+transcript = YouTubeTranscriptApi.get_transcript("{video_id}", languages=["en"])
+text = " ".join([t["text"] for t in transcript])
+print(text)
+'''],
+            capture_output=True, text=True, timeout=30
+        )
+        if result.returncode == 0 and len(result.stdout) > 50:
+            return result.stdout.strip(), "YouTube Transcript API"
     except Exception as e:
-        print(f"Transcript error: {e}")
-        return None
-
-
-def get_video_info(video_id):
-    """Get video title, description from oEmbed."""
+        print(f"youtube-transcript-api failed: {e}")
+    
+    # Fallback: try Invidious API
     try:
-        conn = http.client.HTTPSConnection("noembed.com")
-        headers = {"Content-Type": "application/json"}
-        data = json.dumps({"url": f"https://www.youtube.com/watch?v={video_id}"})
-        conn.request("POST", "/1/embed", data, headers)
+        import http.client
+        conn = http.client.HTTPSConnection("invidious.fdn.fr")
+        conn.request("GET", f"/api/v1/videos/{video_id}")
         response = conn.getresponse()
         if response.status == 200:
-            info = json.loads(response.read().decode())
-            return info
+            data = json.loads(response.read())
+            captions = data.get('captions', [])
+            for cap in captions:
+                if cap.get('languageCode') == 'en':
+                    # Get caption track
+                    conn2 = http.client.HTTPSConnection("invidious.fdn.fr")
+                    conn2.request("GET", f"/api/v1/captions/{video_id}?label=English")
+                    resp2 = conn2.getresponse()
+                    if resp2.status == 200:
+                        import base64
+                        import zlib
+                        try:
+                            raw = base64.b64decode(resp2.read())
+                            text = zlib.decompress(raw, 16 + zlib.MAX_WBITS).decode('utf-8')
+                            # Extract text from TTML
+                            import re
+                            texts = re.findall(r'<text[^>]*>([^<]+)</text>', text)
+                            if texts:
+                                return " ".join(texts), "Invidious Captions"
+                        except:
+                            pass
+    except Exception as e:
+        print(f"Invidious failed: {e}")
+    
+    return None, None
+
+
+def get_video_title(video_id):
+    """Get video title."""
+    try:
+        import http.client
+        conn = http.client.HTTPSConnection("noembed.com")
+        conn.request("POST", "/1/embed", json.dumps({"url": f"https://www.youtube.com/watch?v={video_id}"}))
+        response = conn.getresponse()
+        if response.status == 200:
+            info = json.loads(response.read())
+            return info.get('title', 'YouTube Video')
     except:
         pass
-    return {}
+    return 'YouTube Video'
 
 
-def generate_from_web_search(video_id, title, description=""):
-    """Use Perplexity Sonar to search for video content and generate insights."""
+def summarize_with_minimax(video_id, transcript, title=""):
+    """Use MiniMax (cheap!) to summarize."""
     if not OPENROUTER_API_KEY:
         return {"error": "OPENROUTER_API_KEY not configured"}
     
-    search_query = f"{title} {description}" if description else title
-    
-    prompt = f"""Search for information about this YouTube video and create structured knowledge notes.
-
-Video Title: {title}
-Video ID: {video_id}
-
-Based on the title, search for what this video is about and generate useful insights.
-
-Create a JSON response with this exact structure:
-{{
-  "title": "{title}",
-  "duration_estimate": "Estimate based on typical content (e.g., 10-15 minutes)",
-  "key_insights": ["3-5 insights about the video content based on title and topic"],
-  "actionable_ideas": ["3-5 practical takeaways"],
-  "best_quote": "A relevant quote or summary"
-}}
-
-Be practical and useful. Return ONLY valid JSON."""
-
-    url = "https://openrouter.ai/api/v1/chat/completions"
-    payload = {
-        "model": "perplexity/sonar-pro",
-        "messages": [{"role": "user", "content": prompt}],
-        "max_tokens": 2000
-    }
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-        "HTTP-Referer": "https://youtube-knowledge-extractor.vercel.app",
-        "X-Title": "YouTube Knowledge Extractor"
-    }
-    
-    try:
-        conn = http.client.HTTPSConnection("openrouter.ai")
-        conn.request("POST", url, json.dumps(payload), headers)
-        response = conn.getresponse()
-        data = json.loads(response.read().decode())
-        content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
-        json_match = re.search(r'\{.*\}', content, re.DOTALL)
-        if json_match:
-            result = json.loads(json_match.group())
-            result['source'] = 'web_search'
-            return result
-        return {"raw": content}
-    except Exception as e:
-        return {"error": str(e)}
-
-
-def summarize_with_llm(video_id, transcript, title=""):
-    """Use Perplexity Sonar via OpenRouter to generate summary from transcript."""
-    if not OPENROUTER_API_KEY:
-        return {"error": "OPENROUTER_API_KEY not configured"}
-    
-    if len(transcript) > 8000:
-        transcript = transcript[-8000:]
+    # Truncate if too long
+    if len(transcript) > 6000:
+        transcript = transcript[-6000:]
     
     prompt = f"""Analyze this YouTube video transcript and create structured notes.
 
 Video Title: {title}
-Video ID: {video_id}
 
 Transcript:
 {transcript}
 
-Create a JSON response with this exact structure:
+Create a JSON with:
 {{
   "title": "Video title",
-  "duration_estimate": "X minutes",
-  "key_insights": ["insight1", "insight2", "insight3"],
-  "actionable_ideas": ["idea1", "idea2", "idea3"],
-  "best_quote": "most impactful quote"
+  "duration_estimate": "X minutes", 
+  "key_insights": ["3-5 insights"],
+  "actionable_ideas": ["3-5 actionable takeaways"],
+  "best_quote": "best quote"
 }}
 
-Return ONLY valid JSON, no markdown."""
+Return ONLY valid JSON."""
 
+    import http.client
     url = "https://openrouter.ai/api/v1/chat/completions"
     payload = {
-        "model": "perplexity/sonar-pro",
+        "model": "minimax/minimax-m2.1",
         "messages": [{"role": "user", "content": prompt}],
-        "max_tokens": 2000
+        "max_tokens": 1500
     }
     headers = {
         "Content-Type": "application/json",
@@ -251,22 +231,22 @@ def extract():
     if not video_id:
         return jsonify({"error": "Invalid YouTube URL"}), 400
     
-    # Get video info
-    video_info = get_video_info(video_id)
-    title = video_info.get('title', 'YouTube Video')
-    description = video_info.get('description', '')
+    title = get_video_title(video_id)
     
-    # Try to get transcript
-    transcript = get_transcript(video_id)
+    # Get transcript
+    transcript, method = get_transcript(video_id)
     
-    if transcript:
-        # Use transcript for analysis
-        summary = summarize_with_llm(video_id, transcript, title)
-    else:
-        # Fallback: use web search to generate insights from title
-        summary = generate_from_web_search(video_id, title, description)
+    if not transcript:
+        return jsonify({
+            "error": "No captions available for this video. Try a video with English subtitles.",
+            "title": title,
+            "video_id": video_id
+        }), 200
     
+    # Summarize with MiniMax
+    summary = summarize_with_minimax(video_id, transcript, title)
     summary['video_id'] = video_id
+    summary['transcript_method'] = method
     
     return jsonify(summary)
 

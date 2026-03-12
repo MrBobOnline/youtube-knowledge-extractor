@@ -7,6 +7,7 @@ Uses Apify starvibe/youtube-video-transcript + MiniMax for summarization
 import os
 import json
 import re
+import http.client
 import urllib.request
 import urllib.parse
 import time

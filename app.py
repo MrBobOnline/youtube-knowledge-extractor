@@ -108,7 +108,7 @@ def get_transcript_apify(video_id):
             actor_url,
             data=data,
             headers={
-                "Authorization": f"Token {APIFY_TOKEN}",
+                "Authorization": f"Bearer {APIFY_TOKEN}",
                 "Content-Type": "application/json"
             }
         )
@@ -124,7 +124,7 @@ def get_transcript_apify(video_id):
         for _ in range(30):
             time.sleep(2)
             status_url = f"https://api.apify.com/v2/acts/triangle~youtube-scraper/runs/{execution_id}"
-            req = urllib.request.Request(status_url, headers={"Authorization": f"Token {APIFY_TOKEN}"})
+            req = urllib.request.Request(status_url, headers={"Authorization": f"Bearer {APIFY_TOKEN}"})
             with urllib.request.urlopen(req) as resp:
                 status_data = json.loads(resp.read())
                 status = status_data.get('data', {}).get('status')
@@ -139,7 +139,7 @@ def get_transcript_apify(video_id):
         
         # Fetch results
         dataset_url = f"https://api.apify.com/v2/datasets/{dataset_id}/items"
-        req = urllib.request.Request(dataset_url, headers={"Authorization": f"Token {APIFY_TOKEN}"})
+        req = urllib.request.Request(dataset_url, headers={"Authorization": f"Bearer {APIFY_TOKEN}"})
         with urllib.request.urlopen(req) as resp:
             items = json.loads(resp.read())
         

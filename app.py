@@ -28,7 +28,7 @@ HTML = '''
     <style>
         body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; max-width: 800px; margin: 50px auto; padding: 20px; background: #0f0f0f; color: #fff; }
         h1 { text-align: center; color: #ff0000; }
-        input { width: 100%; padding: 15px; font-size: 16px; border: none; border-radius: 8px; margin-bottom: 15px; background: #222; color: #fff; }
+        input[type="text"], select { width: 100%; padding: 15px; font-size: 16px; border: none; border-radius: 8px; margin-bottom: 15px; background: #222; color: #fff; box-sizing: border-box; }
         button { width: 100%; padding: 15px; font-size: 16px; background: #ff0000; color: white; border: none; border-radius: 8px; cursor: pointer; margin-bottom: 10px; }
         button:hover { background: #cc0000; }
         button:disabled { background: #666; }
@@ -37,13 +37,25 @@ HTML = '''
         .loading { text-align: center; color: #888; }
         .error { color: #ff6b6b; }
         .success { color: #51cf66; }
+        .row { display: flex; gap: 10px; }
+        .row > * { flex: 1; }
     </style>
 </head>
 <body>
     <h1>📺 YouTube Knowledge Extractor</h1>
     <input type="text" id="url" placeholder="Paste YouTube URL here..." />
-    <button onclick="extract()" id="btn">Extract Knowledge</button>
-    <button onclick="extractAndSave()" id="btn2" class="secondary">Extract + Save to Drive</button>
+    <div class="row">
+        <button onclick="extract()" id="btn">Extract Knowledge</button>
+        <button onclick="extractAndSave()" id="btn2" class="secondary">Save to Drive</button>
+    </div>
+    <select id="folder">
+        <option value="Youtube Summary">Youtube Summary (default)</option>
+        <option value="MellowMindCare">MellowMindCare</option>
+        <option value="Spiritual Echoes">Spiritual Echoes</option>
+        <option value="Edu24co">Edu24co</option>
+        <option value="AtlasCore">AtlasCore</option>
+        <option value="MrBobOS">MrBobOS</option>
+    </select>
     <div id="result"></div>
     <script>
         async function extract() {
@@ -54,19 +66,20 @@ HTML = '''
         }
         async function doExtract(saveToDrive) {
             const url = document.getElementById('url').value;
+            const folder = document.getElementById('folder').value;
             const btn = document.getElementById('btn');
             const btn2 = document.getElementById('btn2');
             const result = document.getElementById('result');
             if(!url) return;
             btn.disabled = true;
             btn2.disabled = true;
-            btn.textContent = 'Transcribing video...';
+            btn.textContent = 'Transcribing...';
             result.innerHTML = '<div class="loading">Using AI to transcribe audio...</div>';
             try {
                 const res = await fetch('/extract', { 
                     method: 'POST', 
                     headers: {'Content-Type': 'application/json'}, 
-                    body: JSON.stringify({url, save_to_drive: saveToDrive}) 
+                    body: JSON.stringify({url, save_to_drive: saveToDrive, drive_folder: folder}) 
                 });
                 const data = await res.json();
                 if (data.error) {
@@ -74,7 +87,7 @@ HTML = '''
                 } else {
                     let html = '<div class="success">✅ Extracted!</div><br>';
                     if (data.drive_url) {
-                        html += '<div class="success">📁 Saved to Drive: <a href="' + data.drive_url + '" target="_blank" style="color:#4dabf7">' + data.drive_url + '</a></div><br>';
+                        html += '<div class="success">📁 Saved to ' + folder + ': <a href="' + data.drive_url + '" target="_blank" style="color:#4dabf7">' + data.drive_url + '</a></div><br>';
                     }
                     html += '<strong>📺 ' + (data.title || 'Unknown') + '</strong><br><br>';
                     html += '<strong>⏱️ Duration:</strong> ' + (data.duration_estimate || 'Unknown') + '<br><br>';
@@ -92,7 +105,7 @@ HTML = '''
             btn.disabled = false;
             btn2.disabled = false;
             btn.textContent = 'Extract Knowledge';
-            btn2.textContent = 'Extract + Save to Drive';
+            btn2.textContent = 'Save to Drive';
         }
     </script>
 </body>
@@ -243,7 +256,7 @@ Return ONLY valid JSON."""
         return {"error": str(e)}
 
 
-def save_to_drive(summary, video_id, title):
+def save_to_drive(summary, video_id, title, folder_name="Youtube Summary"):
     """Save notes to Google Drive."""
     if not GOOGLE_SERVICE_ACCOUNT_JSON:
         return None
@@ -255,14 +268,12 @@ def save_to_drive(summary, video_id, title):
         
         creds_data = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
         
-        # Get access token
         scopes = ['https://www.googleapis.com/auth/drive.file']
         credentials = service_account.Credentials.from_service_account_info(creds_data, scopes=scopes)
         
         drive_service = build('drive', 'v3', credentials=credentials)
         
-        # Find or create "Youtube Summary" folder
-        folder_name = "Youtube Summary"
+        # Find or create folder
         response = drive_service.files().list(
             q=f"name='{folder_name}' and mimeType='application/vnd.google-apps.folder'",
             fields="files(id)"
@@ -271,7 +282,6 @@ def save_to_drive(summary, video_id, title):
         if response.get('files'):
             folder_id = response['files'][0]['id']
         else:
-            # Create folder
             file_metadata = {
                 'name': folder_name,
                 'mimeType': 'application/vnd.google-apps.folder'
@@ -329,6 +339,7 @@ def extract():
     data = request.json
     url = data.get('url', '')
     save_to_drive_flag = data.get('save_to_drive', False)
+    drive_folder = data.get('drive_folder', 'Youtube Summary')
     
     if not url:
         return jsonify({"error": "No URL provided"}), 400
@@ -357,7 +368,7 @@ def extract():
     # Save to Drive if requested
     drive_url = None
     if save_to_drive_flag:
-        drive_url = save_to_drive(summary, video_id, title)
+        drive_url = save_to_drive(summary, video_id, title, drive_folder)
         summary['drive_url'] = drive_url
     
     return jsonify(summary)

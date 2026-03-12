@@ -1,18 +1,21 @@
 #!/usr/bin/env python3
 """
 YouTube Knowledge Extractor - Web App
-Uses direct APIs + MiniMax for cheap summarization
+Uses Apify starvibe/youtube-video-transcript + MiniMax for summarization
 """
 
 import os
 import json
 import re
-import http.client
+import urllib.request
+import urllib.parse
+import time
 from flask import Flask, request, render_template_string, jsonify
 
 app = Flask(__name__)
 
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
+APIFY_TOKEN = os.environ.get("APIFY_TOKEN", "")
 
 HTML = '''
 <!DOCTYPE html>
@@ -45,8 +48,8 @@ HTML = '''
             const result = document.getElementById('result');
             if(!url) return;
             btn.disabled = true;
-            btn.textContent = 'Extracting...';
-            result.innerHTML = '<div class="loading">Fetching transcript...</div>';
+            btn.textContent = 'Transcribing video...';
+            result.innerHTML = '<div class="loading">Using AI to transcribe audio...</div>';
             try {
                 const res = await fetch('/extract', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({url}) });
                 const data = await res.json();
@@ -88,117 +91,104 @@ def extract_video_id(url):
     return None
 
 
-def get_transcript_youtube_api(video_id):
-    """Try YouTube's native caption API."""
+def get_transcript_apify(video_id):
+    """Get transcript using starvibe/youtube-video-transcript actor."""
+    if not APIFY_TOKEN:
+        return None, "APIFY_TOKEN not configured"
+    
     try:
-        conn = http.client.HTTPSConnection("www.youtube.com")
-        conn.request("GET", f"/api/timedtext?lang=en&v={video_id}", headers={"User-Agent": "Mozilla/5.0"})
-        response = conn.getresponse()
-        if response.status == 200:
-            data = response.read().decode('utf-8')
-            if data and len(data) > 20:
-                text = re.sub(r'<[^>]+>', ' ', data)
-                text = re.sub(r'\s+', ' ', text).strip()
-                if len(text) > 50:
-                    return text, "YouTube Captions"
-        return None, None
+        # Start the actor
+        actor_url = "https://api.apify.com/v2/acts/starvibe~youtube-video-transcript/runs"
+        data = json.dumps({
+            "url": f"https://www.youtube.com/watch?v={video_id}",
+            "languages": ["en"]
+        }).encode('utf-8')
+        
+        req = urllib.request.Request(
+            actor_url,
+            data=data,
+            headers={
+                "Authorization": f"Bearer {APIFY_TOKEN}",
+                "Content-Type": "application/json"
+            }
+        )
+        
+        with urllib.request.urlopen(req, timeout=30) as response:
+            result = json.loads(response.read())
+            execution_id = result.get('data', {}).get('id')
+        
+        if not execution_id:
+            return None, "Failed to start Apify actor"
+        
+        # Wait for completion (max 90s for transcription)
+        for _ in range(45):
+            time.sleep(2)
+            status_url = f"https://api.apify.com/v2/acts/starvibe~youtube-video-transcript/runs/{execution_id}"
+            req = urllib.request.Request(status_url, headers={"Authorization": f"Bearer {APIFY_TOKEN}"})
+            with urllib.request.urlopen(req) as resp:
+                status_data = json.loads(resp.read())
+                status = status_data.get('data', {}).get('status')
+                
+                if status == 'SUCCEEDED':
+                    dataset_id = status_data.get('data', {}).get('defaultDatasetId')
+                    break
+                elif status in ['FAILED', 'ABORTED']:
+                    return None, f"Apify failed: {status}"
+        else:
+            return None, "Transcription timed out"
+        
+        # Fetch results
+        dataset_url = f"https://api.apify.com/v2/datasets/{dataset_id}/items"
+        req = urllib.request.Request(dataset_url, headers={"Authorization": f"Bearer {APIFY_TOKEN}"})
+        with urllib.request.urlopen(req) as resp:
+            items = json.loads(resp.read())
+        
+        if items:
+            item = items[0]
+            # The actor returns transcript in different formats
+            transcript = item.get('transcript') or item.get('text') or item.get('content')
+            if transcript:
+                if isinstance(transcript, list):
+                    # Combine all parts
+                    text = " ".join([t.get('text', '') for t in transcript])
+                    return text, "Apify AI Transcription"
+                elif isinstance(transcript, str):
+                    return transcript, "Apify AI Transcription"
+        
+        return None, "No transcript in response"
+        
     except Exception as e:
-        return None, None
+        return None, f"Apify error: {str(e)[:80]}"
 
 
-def get_transcript_invidious(video_id):
-    """Try Invidious API for captions."""
-    invidious_instances = ["invidious.snopyta.org", "invidious.kavin.rocks", "invidious.fdn.fr", "yewtu.be"]
-    
-    for instance in invidious_instances:
-        try:
-            conn = http.client.HTTPSConnection(instance)
-            conn.request("GET", f"/api/v1/videos/{video_id}")
-            response = conn.getresponse()
-            if response.status == 200:
-                data = json.loads(response.read())
-                captions = data.get('captions', [])
-                for cap in captions:
-                    if cap.get('languageCode') == 'en':
-                        label = cap.get('label', '')
-                        conn.request("GET", f"/api/v1/captions/{video_id}?lang=en")
-                        resp2 = conn.getresponse()
-                        if resp2.status == 200:
-                            import base64
-                            try:
-                                raw = base64.b64decode(resp2.read())
-                                import zlib
-                                text = zlib.decompress(raw, 16 + zlib.MAX_WBITS).decode('utf-8')
-                                texts = re.findall(r'<text[^>]*>([^<]+)</text>', text)
-                                if texts:
-                                    return " ".join(texts), f"Invidious ({instance})"
-                            except:
-                                pass
-        except:
-            continue
-    
-    return None, None
-
-
-def get_video_info(video_id):
-    """Get video title and description."""
+def get_video_title(video_id):
+    """Get video title."""
     try:
-        # Try oEmbed
         conn = http.client.HTTPSConnection("noembed.com")
         conn.request("POST", "/1/embed", json.dumps({"url": f"https://www.youtube.com/watch?v={video_id}"}))
         response = conn.getresponse()
         if response.status == 200:
-            return json.loads(response.read())
+            info = json.loads(response.read())
+            return info.get('title', 'YouTube Video')
     except:
         pass
-    return {}
+    return 'YouTube Video'
 
 
-def search_video_info(title):
-    """Search for video content using MiniMax."""
-    if not OPENROUTER_API_KEY:
-        return None
-    
-    prompt = f"""Search for information about this YouTube video based on the title:
-
-Title: {title}
-
-Provide a brief summary of what this video is likely about (2-3 sentences)."""
-
-    try:
-        conn = http.client.HTTPSConnection("openrouter.ai")
-        conn.request("POST", "https://openrouter.ai/api/v1/chat/completions",
-            json.dumps({
-                "model": "minimax/minimax-m2.1",
-                "messages": [{"role": "user", "content": prompt}],
-                "max_tokens": 500
-            }),
-            headers={
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {OPENROUTER_API_KEY}"
-            }
-        )
-        response = conn.getresponse()
-        data = json.loads(response.read().decode())
-        return data.get("choices", [{}])[0].get("message", {}).get("content", "")
-    except:
-        return None
-
-
-def summarize_with_minimax(video_id, content, title=""):
+def summarize_with_minimax(video_id, transcript, title=""):
     """Use MiniMax (cheap!) to summarize."""
     if not OPENROUTER_API_KEY:
         return {"error": "OPENROUTER_API_KEY not configured"}
     
-    if len(content) > 6000:
-        content = content[-6000:]
+    if len(transcript) > 6000:
+        transcript = transcript[-6000:]
     
-    prompt = f"""Analyze this YouTube video content and create structured notes.
+    prompt = f"""Analyze this YouTube video transcript and create structured notes.
 
 Video Title: {title}
 
-Content:
-{content}
+Transcript:
+{transcript}
 
 Create a JSON with:
 {{
@@ -253,44 +243,24 @@ def extract():
     if not video_id:
         return jsonify({"error": "Invalid YouTube URL"}), 400
     
-    # Get video info
-    video_info = get_video_info(video_id)
-    title = video_info.get('title', 'YouTube Video')
-    description = video_info.get('description', '')
+    title = get_video_title(video_id)
     
-    # Try to get transcript
-    transcript, method = get_transcript_youtube_api(video_id)
+    # Get transcript via Apify AI transcription
+    transcript, method = get_transcript_apify(video_id)
     
     if not transcript:
-        transcript, method = get_transcript_invidious(video_id)
+        return jsonify({
+            "error": f"Transcription failed. {method}",
+            "title": title,
+            "video_id": video_id
+        }), 200
     
-    if transcript:
-        # Summarize transcript with MiniMax
-        summary = summarize_with_minimax(video_id, transcript, title)
-        summary['video_id'] = video_id
-        summary['transcript_method'] = method
-        return jsonify(summary)
+    # Summarize with MiniMax
+    summary = summarize_with_minimax(video_id, transcript, title)
+    summary['video_id'] = video_id
+    summary['transcript_method'] = method
     
-    # Fallback: use description or search
-    if description and len(description) > 100:
-        summary = summarize_with_minimax(video_id, description, title)
-        summary['video_id'] = video_id
-        summary['transcript_method'] = "Video description"
-        return jsonify(summary)
-    
-    # Try web search for info
-    search_result = search_video_info(title)
-    if search_result:
-        summary = summarize_with_minimax(video_id, search_result, title)
-        summary['video_id'] = video_id
-        summary['transcript_method'] = "Web search"
-        return jsonify(summary)
-    
-    return jsonify({
-        "error": "No captions available. Try a video with English subtitles enabled.",
-        "title": title,
-        "video_id": video_id
-    }), 200
+    return jsonify(summary)
 
 
 if __name__ == '__main__':
